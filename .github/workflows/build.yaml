@@ -1,0 +1,194 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_DIR: vair
+  # Должно совпадать с github.com/wailsapp/wails/v3 в go.mod
+  WAILS_VERSION: v3.0.0-alpha2.109
+  NODE_VERSION: "22"
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions must agree
+        run: |
+          set -euo pipefail
+          t=$(sed -nE 's/^ *VERSION: *"([^"]+)".*/\1/p' "$APP_DIR/Taskfile.yml" | head -1)
+          g=$(sed -nE 's/^const appVersion = "([^"]+)".*/\1/p' "$APP_DIR/core/bridge.go")
+          c=$(sed -nE 's/^ *version: *"([^"]+)".*/\1/p' "$APP_DIR/build/config.yml" | head -1)
+          echo "Taskfile=$t  bridge.go=$g  config.yml=$c"
+          [ "$t" = "$g" ] && [ "$t" = "$c" ] || { echo "::error::version mismatch"; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            [ "v$t" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != v$t"; exit 1; }
+          fi
+          echo "VERSION=$t" >> "$GITHUB_ENV"
+
+  windows:
+    runs-on: windows-2022
+    needs: check-version
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.APP_DIR }}/go.mod
+          cache-dependency-path: ${{ env.APP_DIR }}/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Download engines (pinned, SHA-256 checked)
+        shell: pwsh
+        working-directory: ${{ env.APP_DIR }}
+        run: ./download-engines.ps1
+
+      - name: Build portable Vair.exe (engines embedded)
+        working-directory: ${{ env.APP_DIR }}
+        run: wails3 task windows:build:portable
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        working-directory: ${{ env.APP_DIR }}
+        run: wails3 task windows:package ISCC="C:/Program Files (x86)/Inno Setup 6/ISCC.exe"
+
+      - name: Collect artifacts and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$APP_DIR/bin/Vair.exe" dist/Vair.exe
+          cp "$APP_DIR"/bin/Vair_*_setup.exe dist/
+          (cd dist && sha256sum * | tee SHA256SUMS-windows.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    needs: check-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.APP_DIR }}/go.mod
+          cache-dependency-path: ${{ env.APP_DIR }}/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/frontend/package-lock.json
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Download engines (pinned, SHA-256 checked)
+        working-directory: ${{ env.APP_DIR }}
+        run: scripts/download-engines.sh --os linux --arch amd64
+
+      - name: Build .deb / .rpm / Arch packages
+        working-directory: ${{ env.APP_DIR }}
+        run: wails3 task linux:package
+
+      - name: Check linked libraries
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          if ldd bin/Vair | grep 'not found'; then
+            echo "::error::unresolved libraries"; exit 1
+          fi
+
+      - name: Collect artifacts and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$APP_DIR"/bin/*.deb "$APP_DIR"/bin/*.rpm "$APP_DIR"/bin/*.pkg.tar.zst dist/
+          (cd dist && sha256sum * | tee SHA256SUMS-linux.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined checksums
+        run: |
+          cd dist
+          cat SHA256SUMS-windows.txt SHA256SUMS-linux.txt > SHA256SUMS.txt
+          rm SHA256SUMS-windows.txt SHA256SUMS-linux.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/Vair.exe
+            dist/Vair_*_setup.exe
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/Vair.exe
+            dist/Vair_*_setup.exe
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS.txt
